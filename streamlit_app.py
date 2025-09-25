@@ -50,7 +50,7 @@ def estimate_message_tokens(messages: List) -> int:
 def limit_message_history(messages: List, max_messages: int = None) -> List:
     """
     Limit message history to the last N messages while preserving pairs.
-    Ensures we keep complete request-response pairs.
+    Simple truncation - validation happens separately.
     """
     if max_messages is None:
         max_messages = st.session_state.get('custom_max_messages', MAX_MESSAGES)
@@ -58,19 +58,20 @@ def limit_message_history(messages: List, max_messages: int = None) -> List:
     if len(messages) <= max_messages:
         return messages
     
-    # Keep the last max_messages, but try to preserve request-response pairs
-    # by starting from an even index if possible
-    start_index = len(messages) - max_messages
-    
-    # Try to start with a ModelRequest to preserve conversation flow
-    while start_index > 0 and not isinstance(messages[start_index], ModelRequest):
-        start_index -= 1
-    
-    return messages[start_index:]
+    # Simple truncation from the end
+    return messages[-max_messages:]
 
 
 def clear_chat_history():
-    """Clear the chat history from session state."""
+    """Clear the chat history from session state, but preserve complete tool sequences."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        st.rerun()
+        return
+    
+    # Don't preserve any tool messages to avoid sequence issues
+    # Tool calls must be followed by tool returns in proper sequence
+    # Clearing all messages ensures we start fresh without orphaned tool messages
     st.session_state.messages = []
     st.rerun()
 
@@ -88,14 +89,81 @@ def display_message_part(part):
     # text
     elif part.part_kind == 'text':
         with st.chat_message("assistant"):
-            st.markdown(part.content)             
+            st.markdown(part.content)
+    # tool-call
+    elif part.part_kind == 'tool-call':
+        with st.chat_message("assistant"):
+            with st.expander(f"🔧 Tool Call: {part.tool_name}", expanded=False):
+                st.code(str(part.args), language="json")
+    # tool-return  
+    elif part.part_kind == 'tool-return':
+        with st.chat_message("assistant"):
+            with st.expander(f"📋 Tool Result: {part.tool_name}", expanded=False):
+                st.text(str(part.content))             
+
+def validate_message_history(messages: List) -> List:
+    """
+    Validate and clean message history to ensure proper tool call sequences.
+    Remove any orphaned tool messages that could cause API errors.
+    """
+    if not messages:
+        return messages
+    
+    validated_messages = []
+    tool_calls_stack = []  # Track pending tool calls
+    
+    for msg in messages:
+        if isinstance(msg, (ModelRequest, ModelResponse)):
+            msg_tool_calls = []
+            msg_tool_returns = []
+            other_parts = []
+            
+            # Categorize parts in this message
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    msg_tool_calls.append(part)
+                elif isinstance(part, ToolReturnPart):
+                    msg_tool_returns.append(part)
+                else:
+                    other_parts.append(part)
+            
+            # Handle tool calls - add to stack
+            if msg_tool_calls:
+                tool_calls_stack.extend(msg_tool_calls)
+                # Keep the message with tool calls
+                validated_messages.append(msg)
+            
+            # Handle tool returns
+            elif msg_tool_returns:
+                # Only keep tool returns if we have pending tool calls
+                if tool_calls_stack:
+                    # Remove corresponding tool calls from stack
+                    for _ in msg_tool_returns:
+                        if tool_calls_stack:
+                            tool_calls_stack.pop(0)
+                    validated_messages.append(msg)
+                # Skip orphaned tool returns
+            
+            # Handle regular messages (no tool parts)
+            elif other_parts:
+                validated_messages.append(msg)
+    
+    return validated_messages
 
 async def run_agent_with_streaming(user_input):
     # Limit message history before passing to agent
     limited_messages = limit_message_history(st.session_state.messages)
     
+    # Validate message history to prevent tool sequence errors
+    validated_messages = validate_message_history(limited_messages)
+    
+    # Debug logging
+    # print(f"Original messages: {len(st.session_state.messages)}")
+    # print(f"Limited messages: {len(limited_messages)}")
+    # print(f"Validated messages: {len(validated_messages)}")
+    
     async with agent.run_stream(
-        user_input, deps=st.session_state.agent_deps, message_history=limited_messages
+        user_input, deps=st.session_state.agent_deps, message_history=validated_messages
     ) as result:
         async for message in result.stream_text(delta=True):  
             yield message
@@ -114,7 +182,7 @@ async def run_agent_with_streaming(user_input):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 async def main():
-    st.title("BizTalk Document Chatbot")
+    st.title("DocuBot AI")
 
     # Sidebar for conversation management
     with st.sidebar:
